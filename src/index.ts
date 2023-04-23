@@ -9,7 +9,7 @@
  */
 
 import { Client, collectPaginatedAPI } from "@notionhq/client"
-import { PageObjectResponse } from "@notionhq/client/build/src/api-endpoints";
+import { BlockObjectResponse, PageObjectResponse } from "@notionhq/client/build/src/api-endpoints";
 
 export interface Env {
   NOTION_TOKEN: string;
@@ -55,11 +55,11 @@ interface ReadWiseHighlight {
   source_type: string,
   category: string,
   note?: string,
-  location?: integer,
+  location?: number,
   location_type?: string,
   highlighted_at: string,
   highlight_url: string,
-  modified_highlights?: integer[];
+  modified_highlights?: number[];
 }
 
 
@@ -76,12 +76,13 @@ class ReadWiseClient {
     return response;
   }
 
-  async post(path: string, body: anything): Promise<Response> {
+  async post(path: string, body: any): Promise<Response> {
     path = removeSlash(path);
     const response = await fetch(`https://readwise.io/api/v2/${path}`, {
       method: 'POST',
       headers: {
         Authorization: `Token ${this.token}`,
+        'Content-Type': 'application/json',
       },
       body: JSON.stringify(body),
     });
@@ -100,8 +101,8 @@ class ReadWiseClient {
   }
 
   async createHighlights(highlights: ReadWiseHighlight[]): Promise<ReadWiseHighlight[]> {
-    const response = await this.post("highlights", highlighs);
-    return resp.json();
+    const response = await this.post("highlights", { highlights });
+    return response.json();
   }
 }
 
@@ -180,7 +181,7 @@ class NotionClient {
           {
             timestamp: "created_time",
             created_time: {
-              on_or_after: fromTime
+              after: fromTime
             }
           }
         ]
@@ -201,22 +202,43 @@ class NotionClient {
     for (const pageObject of pageObjects) {
       const page = pageObject as PageObjectResponse;
       const props = page.properties;
-      let highlight = {
+
+      if (props["书名"].type !== "formula") {
+        continue;
+      }
+
+      if (props["书名"].formula.type !== "string") {
+        continue;
+      }
+
+      if (props["Link"].type !== "url") {
+        continue;
+      }
+
+      if (props["Created time"].type !== "created_time") {
+        continue;
+      }
+
+      const title = props["书名"].formula.string;
+      const url = props["Link"].url;
+
+      let highlight:HighlightInNotion = {
         id: pageObject.id,
-        title: props["书名"].formula.string,
-        url: props["Link"].url,
-        created_date: props["Created At"].date.start,
+        title: title !== null ? title : "",
+        url: url !== null ? url : "",
+        created_date: props["Created time"].created_time,
         content: "",
       };
 
-2      // Get notion page children blocks
+      // Get notion page children blocks
       const resp = await this.notion.blocks.children.list({
         block_id: page.id
       });
       const blocks = resp.results;
 
       // Get block text and concaenate it to highlight content
-      for (const block of blocks) {
+      for (const blockObj of blocks) {
+        const block = blockObj as BlockObjectResponse;
         if (block.type === "paragraph") {
           let plain_text = block.paragraph.rich_text[0].plain_text;
           // Remove first line and last 2 lines
@@ -284,11 +306,18 @@ class HighlightManager {
 
       readwiseHighlights.push(readwiseHighlight);
     }
-    return readwiseHighlights;
+
+    if (readwiseHighlights.length === 0) {
+      return { message: "No highlights to sync" };
+    }
     
     // update all highlights to readwise
+    const updateResponse = await this.readWiseClient.createHighlights(readwiseHighlights);
 
     // update latest sync time
+    await this.env.syncbook.put("latest_sync_time", notionHighlights[notionHighlights.length - 1].created_date);
+
+    return updateResponse;
   }
 }
 
@@ -302,6 +331,11 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
+    // only allow access to root endpoint
+    if (new URL(request.url).pathname !== "/force-sync") {
+      return new Response("", { status: 404 });
+    }
+
     const results = await new HighlightManager(env).syncBookHighlights();
     return printJSON(results);
   },
@@ -310,6 +344,6 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ) {
-    //ctx.waitUntil(syncBookHighlights());
+    ctx.waitUntil(new HighlightManager(env).syncBookHighlights());
   },
 };
