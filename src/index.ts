@@ -8,19 +8,60 @@
  * Learn more at https://developers.cloudflare.com/workers/
  */
 
-import { Client } from "@notionhq/client"
+import { Client, collectPaginatedAPI } from "@notionhq/client"
+import { PageObjectResponse } from "@notionhq/client/build/src/api-endpoints";
 
 export interface Env {
   NOTION_TOKEN: string;
   FLOMO_DB_ID: string;
   READWISE_TOKEN: string;
 
-  STATE_KV: KVNamespace;
+  syncbook: KVNamespace;
 }
 
 function removeSlash(path: string): string {
   return path.replace(/^\/+|\/+$/g, '');
 }
+
+// ReadWise Highlights Query Response interface
+interface ReadWiseHighlightsQueryResponse {
+  count: number;
+  next: string;
+  previous: string;
+  results: {
+    id: number,
+    title: string,
+    author: string,
+    category: string,
+    source: string,
+    num_highlights: number,
+    last_highlight_at: string,
+    updated: string,
+    cover_image_url: string,
+    highlights_url: string,
+    source_url: string,
+    asin: string,
+    tags: string[],
+    document_note: string
+  }[];
+}
+
+interface ReadWiseHighlight {
+  text: string,
+  title: string,
+  author: string,
+  image_url: string,
+  source_url: string,
+  source_type: string,
+  category: string,
+  note?: string,
+  location?: integer,
+  location_type?: string,
+  highlighted_at: string,
+  highlight_url: string,
+  modified_highlights?: integer[];
+}
+
 
 class ReadWiseClient {
   constructor(private token: string) { }
@@ -35,7 +76,19 @@ class ReadWiseClient {
     return response;
   }
 
-  async getLatestHighlight(): Promise<any> {
+  async post(path: string, body: anything): Promise<Response> {
+    path = removeSlash(path);
+    const response = await fetch(`https://readwise.io/api/v2/${path}`, {
+      method: 'POST',
+      headers: {
+        Authorization: `Token ${this.token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    return response;
+  }
+
+  async getLatestHighlight(): Promise<ReadWiseHighlightsQueryResponse> {
     const params = new URLSearchParams({
       source: "dedao",
       category: "books",
@@ -45,8 +98,14 @@ class ReadWiseClient {
     const response = await this.get("books", params);
     return await response.json();
   }
+
+  async createHighlights(highlights: ReadWiseHighlight[]): Promise<ReadWiseHighlight[]> {
+    const response = await this.post("highlights", highlighs);
+    return resp.json();
+  }
 }
 
+// Dedao Top Hits Response interface
 interface DedaoTopHitsResponse {
   c: {
     data: {
@@ -88,7 +147,15 @@ class DedaoClient {
   }
 }
 
-class NotionClientWrapper {
+interface HighlightInNotion {
+  id: string;
+  title: string;
+  created_date: string;
+  content: string;
+  url: string;
+}
+
+class NotionClient {
   private notion: Client;
 
   constructor(notionToken: string, private databaseId: string) {
@@ -97,54 +164,136 @@ class NotionClientWrapper {
     });
   }
 
-  async getDedaoHighlights() {
-    const response = await this.notion.databases.query({
+  async getDedaoHighlights(fromTime: string): Promise<HighlightInNotion[]> {
+    const resp = await this.notion.databases.query({
       database_id: this.databaseId,
       filter: {
-        property: "得到电子书",
-        formula: {
-          checkbox: {
-            equals: true,
+        and: [
+          {
+            property: "得到电子书",
+            formula: {
+              checkbox: {
+                equals: true,
+              },
+            }
           },
-        },
+          {
+            timestamp: "created_time",
+            created_time: {
+              on_or_after: fromTime
+            }
+          }
+        ]
       },
+      sorts: [
+        {
+          timestamp: "created_time",
+          direction: "ascending",
+        }
+      ],
+      page_size: 10,
     });
-    return response.results;
+
+    const pageObjects = resp.results;
+
+    // convert pageObjects to HighlightInNotion[]
+    const highlights = [];
+    for (const pageObject of pageObjects) {
+      const page = pageObject as PageObjectResponse;
+      const props = page.properties;
+      let highlight = {
+        id: pageObject.id,
+        title: props["书名"].formula.string,
+        url: props["Link"].url,
+        created_date: props["Created At"].date.start,
+        content: "",
+      };
+
+2      // Get notion page children blocks
+      const resp = await this.notion.blocks.children.list({
+        block_id: page.id
+      });
+      const blocks = resp.results;
+
+      // Get block text and concaenate it to highlight content
+      for (const block of blocks) {
+        if (block.type === "paragraph") {
+          let plain_text = block.paragraph.rich_text[0].plain_text;
+          // Remove first line and last 2 lines
+          plain_text = plain_text.substring(plain_text.indexOf("\n") + 1);
+          plain_text = plain_text.substring(0, plain_text.lastIndexOf("\n"));
+          plain_text = plain_text.substring(0, plain_text.lastIndexOf("\n"));
+          highlight.content = plain_text;
+          break;
+        }
+      }
+
+      highlights.push(highlight);
+    }
+    return highlights;
   }
-
-
-
-  // ... (Other methods for working with Notion)
 }
 
 class HighlightManager {
   private readWiseClient: ReadWiseClient;
-  private notionClient: NotionClientWrapper;
+  private notionClient: NotionClient;
   private dedaoClient: DedaoClient;
 
   constructor(private env: Env) {
-    this.notionClient = new NotionClientWrapper(env.NOTION_TOKEN, env.FLOMO_DB_ID);
+    this.notionClient = new NotionClient(env.NOTION_TOKEN, env.FLOMO_DB_ID);
     this.readWiseClient = new ReadWiseClient(env.READWISE_TOKEN);
     this.dedaoClient = new DedaoClient();
   }
 
-  async syncBookHighlights() {
-    const pages = await this.notionClient.getDedaoHighlights();
-    const latestHighlight = await this.readWiseClient.getLatestHighlight();
-    const latestHighlightText = latestHighlight.results[0]?.title || "";
-    let isNewHighlight = true;
-    const highlights = [];
-
-    for (const page of pages) {
-      // ... (Loop content for highlights)
-
-      const { sourceUrl, imageUrl, author } = await this.dedaoClient.getBookData(page.id);
-
-      // ... (Create highlight object and push to highlights array)
+  async syncBookHighlights(fromTime?: string) {
+    // if fromTime is not set or is empty, calulate fromTime
+    if (!fromTime) {
+      // Get from syncbook kv
+      const lastestSyncTime = await this.env.syncbook.get("latest_sync_time");
+      if (lastestSyncTime) {
+        fromTime = lastestSyncTime;
+      }
+      else {
+        fromTime = "2023-01-07";
+      }
     }
 
-    // ... (Check for new highlights and sync them)
+    console.log("syncBookHighlights: fromTime:", fromTime);
+
+      
+    // query notion for highlights after the latest update time
+    let notionHighlights = await this.notionClient.getDedaoHighlights(fromTime);
+
+
+    // use dedao API to get book data for the highlights
+    let readwiseHighlights = [];
+    for (const notionHighlight of notionHighlights) {
+      let bookData = await this.dedaoClient.getBookData(notionHighlight.title);
+      
+      let readwiseHighlight: ReadWiseHighlight = {
+        text: notionHighlight.content,
+        title: notionHighlight.title,
+        author: bookData.author,
+        image_url: bookData.imageUrl,
+        source_url: bookData.sourceUrl,
+        source_type: "dedao",
+        category:"books",
+        highlighted_at: notionHighlight.created_date,
+        highlight_url: notionHighlight.url,
+      };
+
+      readwiseHighlights.push(readwiseHighlight);
+    }
+    return readwiseHighlights;
+    
+    // update all highlights to readwise
+
+    // update latest sync time
   }
+}
+
+function printJSON(json: any) {
+  return new Response(`<pre>${JSON.stringify(json, null, 2)}</pre>`);
 }
 
 export default {
@@ -153,14 +302,8 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    const url = new URL(request.url);
-    if (url.pathname === "/highlights/latest") {
-      const readWiseClient = new ReadWiseClient(env.READWISE_TOKEN);
-      const latestHighlight = await readWiseClient.getLatestHighlight();
-      return new Response(`Latest Highlight: ${JSON.stringify(latestHighlight)}`);
-    }
-
-    return new Response("/Sync/");
+    const results = await new HighlightManager(env).syncBookHighlights();
+    return printJSON(results);
   },
   async scheduled(
     event: ScheduledEvent,

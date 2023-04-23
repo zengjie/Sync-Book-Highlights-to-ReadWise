@@ -2,6 +2,9 @@ name = "sync-book-highlights-to-readwise"
 main = "src/index.ts"
 compatibility_date = "2023-04-01"
 send_metrics = false
+kv_namespaces = [
+  { binding = "syncbook", id = "013a3df724c944e88ae48eae32be942f", preview_id = "c15ced9d77c54d7991e0cf86068f4e62"}
+]
 
 [triggers]
 crons = ["0 */1 * * *"]
